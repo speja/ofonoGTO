@@ -38,16 +38,26 @@
 #include <gatchat.h>
 #include <gattty.h>
 #include <gdbus.h>
+#include <asm/ioctls.h>
+#include <linux/serial.h>
+#include <termios.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <poll.h>
+
 #include "ofono.h"
+
 #define OFONO_API_SUBJECT_TO_CHANGE
 #include <ofono/dbus.h>
 #include <ofono/plugin.h>
-#include <ofono/log.h>
 #include <ofono/modem.h>
+#include <ofono/log.h>
 #include <ofono/devinfo.h>
-#include <ofono/netreg.h>
 #include <ofono/phonebook.h>
 #include <ofono/sim.h>
+#include <ofono/netreg.h>
 #include <ofono/sms.h>
 #include <ofono/gprs.h>
 #include <ofono/gprs-context.h>
@@ -57,6 +67,7 @@
 #include <string.h>
 
 #include <ell/ell.h>
+
 #include <drivers/mbimmodem/mbim.h>
 #include <drivers/mbimmodem/mbim-message.h>
 #include <drivers/mbimmodem/mbim-desc.h>
@@ -126,6 +137,13 @@ static const char *sgpsc_prefix[] = { "^SGPSC:", NULL };
 
 typedef void (*OpenResultFunc)(gboolean success, struct ofono_modem *modem);
 
+struct mbim_data {
+	struct mbim_device *device;
+	uint16_t max_segment;
+	uint8_t max_outstanding;
+	uint8_t max_sessions;
+};
+
 struct gemalto_data {
 	gboolean init_done;
 	GIOChannel *channel;
@@ -168,14 +186,10 @@ struct gemalto_data {
 
 	/* struct mbim_device* or struct qmi_device* */
 	union {
-	  struct mbim_device *mbim;
-	  struct qmi_device  *qmi;
+		/* mbim data */
+		struct mbim_data mbim;
+		struct qmi_device  *qmi;
 	} device;
-
-	/* mbim data */
-	uint16_t max_segment;
-	uint8_t max_outstanding;
-	uint8_t max_sessions;
 
 	/* hardware monitor variables */
 	struct {
@@ -1338,7 +1352,7 @@ static void gemalto_hardware_control_disable(struct ofono_modem *modem)
  * modem plugin
  ******************************************************************************/
 
-static int mbim_parse_descriptors(struct gemalto_data *md, const char *file)
+static int mbim_parse_descriptors(struct mbim_data *md, const char *file)
 {
 	void *data;
 	size_t len;
@@ -1364,9 +1378,10 @@ static int mbim_parse_descriptors(struct gemalto_data *md, const char *file)
 	return 0;
 }
 
-static int mbim_probe(struct ofono_modem *modem, struct gemalto_data *data)
+static int mbim_probe(struct ofono_modem *modem, struct gemalto_data *gdata)
 {
 	const char *descriptors;
+	struct mbim_data *data = &gdata->device.mbim;
 	int err;
 
 	descriptors = gemalto_get_string(modem, "DescriptorFile");
@@ -1430,8 +1445,8 @@ static void gemalto_remove(struct ofono_modem *modem)
 	}
 
 	if (data->mbim == STATE_PRESENT) { // FIXME
-		mbim_device_shutdown(data->device.mbim);
-		mbim_device_unref(data->device.mbim); // FIXME
+		mbim_device_shutdown(data->device.mbim.device);
+		mbim_device_unref(data->device.mbim.device); // FIXME
 		data->mbim = STATE_ABSENT;
 	}
 
@@ -1753,15 +1768,6 @@ static void gemalto_initialize(struct ofono_modem *modem)
 	data->online_timer = 0;
 }
 
-#include <asm/ioctls.h>
-#include <linux/serial.h>
-#include <termios.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
-#include <sys/wait.h>
-#include <poll.h>
-
 static int write_fd(int fd, void *buf, size_t size) {
 	size_t written = 0;
 	int error = 0;
@@ -1988,9 +1994,8 @@ static void mbim_subscriptions(struct ofono_modem *modem, gboolean subscribe)
 		/* unsubscribe all */
 		mbim_message_set_arguments(message, "av", 0);
 
-	mbim_device_send(md->device.mbim, 0, message, NULL, NULL, NULL);
+	mbim_device_send(md->device.mbim.device, 0, message, NULL, NULL, NULL);
 }
-
 
 static void mbim_device_caps_info_cb(struct mbim_message *message, void *user)
 {
@@ -2022,7 +2027,7 @@ static void mbim_device_caps_info_cb(struct mbim_message *message, void *user)
 	if (!r)
 		goto error;
 
-	md->max_sessions = max_sessions;
+	md->device.mbim.max_sessions = max_sessions;
 
 	DBG("DeviceId: %s", device_id);
 	DBG("FirmwareInfo: %s", firmware_info);
@@ -2069,7 +2074,7 @@ static void mbim_device_caps_info_cb(struct mbim_message *message, void *user)
 					"16yuu", mbim_uuid_stk, 1,
 					MBIM_CID_STK_PAC);
 
-	if (mbim_device_send(md->device.mbim, 0, message,
+	if (mbim_device_send(md->device.mbim.device, 0, message,
 				NULL, NULL, NULL)) {
 		md->mbim = STATE_PRESENT;
 		goto other_devices;
@@ -2077,7 +2082,7 @@ static void mbim_device_caps_info_cb(struct mbim_message *message, void *user)
 
 
 error:
-	mbim_device_shutdown(md->device.mbim);
+	mbim_device_shutdown(md->device.mbim.device);
 
 other_devices:
 
@@ -2096,8 +2101,8 @@ static void mbim_device_ready(void *user_data)
 					1, MBIM_COMMAND_TYPE_QUERY);
 
 	mbim_message_set_arguments(message, "");
-	mbim_device_send(md->device.mbim, 0, message, mbim_device_caps_info_cb,
-		modem, NULL);
+	mbim_device_send(md->device.mbim.device, 0, message,
+				mbim_device_caps_info_cb, modem, NULL);
 }
 
 static void mbim_device_closed(void *user_data)
@@ -2120,10 +2125,10 @@ static void mbim_device_closed(void *user_data)
 	/* reset the state for future attempts */
 	md->mbim = STATE_PROBE;
 
-	if(md->device.mbim)
-		mbim_device_unref(md->device.mbim);
+	if(md->device.mbim.device)
+		mbim_device_unref(md->device.mbim.device);
 
-	md->device.mbim = NULL;
+	md->device.mbim.device = NULL;
 }
 
 static int mbim_enable(struct ofono_modem *modem)
@@ -2134,7 +2139,7 @@ static int mbim_enable(struct ofono_modem *modem)
 	int DTR_flag = TIOCM_DTR;
 	struct gemalto_data *md = ofono_modem_get_data(modem);
 
-	DBG("modem struct: %p", modem);
+	DBG("%p", modem);
 
 	device = gemalto_get_string(modem, "NetworkControl");
 	if (!device)
@@ -2152,16 +2157,16 @@ static int mbim_enable(struct ofono_modem *modem)
 	ioctl(fd, TIOCMBIS, &DTR_flag);
 
 	DBG("device: %s opened successfully", device);
-	md->device.mbim = mbim_device_new(fd, md->max_segment);
-	DBG("created new device %p", md->device.mbim);
+	md->device.mbim.device = mbim_device_new(fd, md->device.mbim.max_segment);
+	DBG("created new device %p", md->device.mbim.device);
 
-	mbim_device_set_close_on_unref(md->device.mbim, true);
-	mbim_device_set_max_outstanding(md->device.mbim, md->max_outstanding);
-	mbim_device_set_ready_handler(md->device.mbim,
+	mbim_device_set_close_on_unref(md->device.mbim.device, true);
+	mbim_device_set_max_outstanding(md->device.mbim.device, md->device.mbim.max_outstanding);
+	mbim_device_set_ready_handler(md->device.mbim.device,
 					mbim_device_ready, modem, NULL);
-	mbim_device_set_disconnect_handler(md->device.mbim,
+	mbim_device_set_disconnect_handler(md->device.mbim.device,
 				mbim_device_closed, modem, NULL);
-	mbim_device_set_debug(md->device.mbim, gemalto_mbim_debug, "MBIM:", NULL);
+	mbim_device_set_debug(md->device.mbim.device, gemalto_mbim_debug, "MBIM:", NULL);
 
 	return -EINPROGRESS;
 
@@ -2619,7 +2624,7 @@ static void gemalto_post_sim(struct ofono_modem *modem)
 
 	if (data->mbim == STATE_PRESENT) {
 		/* very important to set the interface ready */
-		mbim_sim_probe(data->device.mbim);
+		mbim_sim_probe(data->device.mbim.device);
 	}
 
 	ofono_phonebook_create(modem, 0, "atmodem", data->app);
@@ -2674,15 +2679,15 @@ static void autoattach_probe_and_continue(gboolean ok, GAtResult *result,
 	if (data->mbim == STATE_PRESENT) {
 		gprs = ofono_gprs_create(modem, OFONO_VENDOR_GEMALTO, "atmodem",
 								data->app);
-		ofono_gprs_set_cid_range(gprs, 0, data->max_sessions);
+		ofono_gprs_set_cid_range(gprs, 0, data->device.mbim.max_sessions);
 		if (data->model == 0x65) {
 			struct gemalto_mbim_composite comp;
-			comp.device = data->device.mbim;
+			comp.device = data->device.mbim.device;
 			comp.chat = data->app;
 			comp.at_cid = 4;
 			gc = ofono_gprs_context_create(modem, 0, "gemaltomodemmbim", &comp);
 		} else /* model == 0x5d, 0x62 (standard mbim driver) */
-			gc = ofono_gprs_context_create(modem, 0, "mbim", data->device.mbim);
+			gc = ofono_gprs_context_create(modem, 0, "mbim", data->device.mbim.device);
 	} else if (data->qmi == STATE_PRESENT) {
 		gprs = ofono_gprs_create(modem, OFONO_VENDOR_GEMALTO, "atmodem",
 								data->app);
@@ -2821,7 +2826,7 @@ static void mbim_radio_off_for_disable(struct mbim_message *message, void *user)
 
 	DBG("%p", modem);
 
-	mbim_device_shutdown(md->device.mbim);
+	mbim_device_shutdown(md->device.mbim.device);
 }
 
 static int gemalto_disable_serial(struct ofono_modem *modem)
@@ -2867,11 +2872,11 @@ static int gemalto_disable(struct ofono_modem *modem)
 						MBIM_COMMAND_TYPE_SET);
 		mbim_message_set_arguments(message, "u", 0);
 
-		mbim_device_send(data->device.mbim, 0, message,
+		mbim_device_send(data->device.mbim.device, 0, message,
 			mbim_radio_off_for_disable, modem, NULL);
-		mbim_device_shutdown(data->device.mbim);
-		mbim_device_unref(data->device.mbim);
-		data->device.mbim = NULL;
+		mbim_device_shutdown(data->device.mbim.device);
+		mbim_device_unref(data->device.mbim.device);
+		data->device.mbim.device = NULL;
 		data->mbim = STATE_ABSENT;
 	}
 
@@ -2908,5 +2913,5 @@ static void gemalto_exit(void)
 }
 
 OFONO_PLUGIN_DEFINE(gemalto, "Gemalto modem plugin", VERSION,
-		OFONO_PLUGIN_PRIORITY_DEFAULT, gemalto_init, gemalto_exit)
+			OFONO_PLUGIN_PRIORITY_DEFAULT, gemalto_init, gemalto_exit)
 
